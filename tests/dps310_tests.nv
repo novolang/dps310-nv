@@ -1,0 +1,1399 @@
+// dps310_tests — the driver over a double of the part: a register file
+// that answers on an I2C bus and on an SPI bus the way Infineon's data
+// sheet (V1.2, 2020-10-15, sections 4 to 8) says a DPS310 does, so the
+// framing, ID, the coefficient decoding, the compensation, the modes, the
+// settings, the FIFO, the temperature workaround and the bring-up are
+// checked on the host, one transaction at a time.  The log keeps what the
+// controller sent, in a form the tests compare.
+//
+// Log entries: an I2C write is 1, the address, the bytes sent, -1; an I2C
+// read is 2, the address, the register, the count, -1; an SPI
+// transaction is 3, the bytes the controller clocked out, -1.
+
+use std.test
+use embedded_hal.{ BoardI2c, BoardSpi, BoardGpio, I2cBus, SpiBus, GpioOut }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_baro.{ Pascals, Barometer }
+use dev_thermo.{ TempMilliC, Thermometer }
+use dev_id.{ DeviceId, Identifiable }
+use dps310
+use dps310.{ Dps310, Dps310Spi, Dps310Port, Dps310Cal, Dps310Sample }
+
+// ── The double ───────────────────────────────────────────────────────
+//
+// `regs` is the part's registers.  `st` is the double's state: 0 is 0
+// before an SPI control byte and 1 after it, 1 the register, 2 R/W, 4 1
+// when a part is there, 9 1 inside an SPI transaction, 10 the number of
+// FIFO words taken, 20 and 21 the SPI clock and mode, 22 the I2C clock,
+// 60 the polls of MEAS_CFG that read the start-up bits as not ready, 61 and
+// 62 the TMP_RDY and PRS_RDY flags, 65 1 when a measurement never
+// finishes, 66 the polls a reset leaves, 67 1 to keep no log, 68 1 when a
+// pressure never finishes, 70 the I2C
+// address, 98 the bytes in the FIFO and 99 the entries in the log.  `ro`
+// lists registers that ignore a write.  `fifo` holds the FIFO's words as
+// three bytes each, and `log` the log.  Everything is kept in maps, which a
+// method changes through its receiver.
+
+struct Chip
+    regs: HashMap<Int, Int>
+    st: HashMap<Int, Int>
+    ro: HashMap<Int, Int>
+    log: HashMap<Int, Int>
+    fifo: HashMap<Int, Int>
+
+fn at(m: HashMap<Int, Int>, k: Int) -> Int
+    m.get(k) ?? 0
+
+// The chip with ID, the coefficients and the reset values in place.
+fn chip() -> Chip
+    let c = Chip { regs: HashMap.new(), st: HashMap.new(), ro: HashMap.new(), log: HashMap.new(), fifo: HashMap.new() }
+    c.regs.insert(0x0D, 0x10)
+    c.regs.insert(0x32, 0x00)
+    c.st.insert(4, 1)
+    c.st.insert(66, 3)
+    c.st.insert(70, 0x77)
+    put_cal(c)
+    c
+
+// The coefficient bytes of the test part (see `test_the_worked_numbers`):
+// c0 = 175, c1 = -2000, c00 = 126653, c10 = -55000, c01 = -1700,
+// c11 = -1000, c20 = 10000, c21 = -1200, c30 = -2000.
+fn cal_bytes() -> [Int]
+    [0x0A, 0xF8, 0x30, 0x1E, 0xEB, 0xDF, 0x29, 0x28, 0xF9, 0x5C, 0xFC, 0x18, 0x27, 0x10, 0xFB, 0x50, 0xF8, 0x30]
+
+fn put_cal(c: Chip)
+    let b = cal_bytes()
+    for i in 0..18
+        c.regs.insert(0x10 + i, b[i])
+
+// Appends a value to the log, unless the test keeps none.
+fn log_push(c: Chip, v: Int)
+    if at(c.st, 67) == 1
+        return
+    let n = at(c.st, 99)
+    c.log.insert(n, v)
+    c.st.insert(99, n + 1)
+
+// Empties the log.
+fn log_clear(c: Chip)
+    c.st.insert(99, 0)
+
+// The FIFO is on when CFG_REG's FIFO_EN is set.
+fn fifo_on(c: Chip) -> Bool
+    (at(c.regs, 0x09) & 0x02) != 0
+
+// The FIFO words that have not been taken.
+fn fifo_left(c: Chip) -> Int
+    at(c.st, 98) / 3 - at(c.st, 10)
+
+// MEAS_CFG as the part answers it: the control field as written, the
+// start-up bits once the polls of a reset have passed, and the two result
+// flags.
+fn meas_read(c: Chip) -> Int
+    var v = at(c.regs, 0x08) & 0x07
+    if at(c.st, 60) > 0
+        c.st.insert(60, at(c.st, 60) - 1)
+    else
+        v = v | 0xC0
+    if at(c.st, 61) == 1
+        v = v | 0x20
+    if at(c.st, 62) == 1
+        v = v | 0x10
+    v
+
+// A data register 0x00 to 0x05 as the part answers it: the FIFO's oldest
+// word when the FIFO is on (0x800000 when it is empty), which the read of
+// 0x02 takes out; the stored bytes otherwise.  Reading clears the flag of
+// the result.
+fn data_read(c: Chip, reg: Int) -> Int
+    if reg <= 0x02
+        c.st.insert(62, 0)
+    else
+        c.st.insert(61, 0)
+    if reg <= 0x02 and fifo_on(c)
+        if fifo_left(c) <= 0
+            if reg == 0x00
+                return 0x80
+            return 0
+        let k = at(c.st, 10) * 3 + reg
+        let v = at(c.fifo, k)
+        if reg == 0x02
+            c.st.insert(10, at(c.st, 10) + 1)
+        return v
+    at(c.regs, reg)
+
+// A register as the part answers it.
+fn chip_read(c: Chip, reg: Int) -> Int
+    if reg == 0x08
+        return meas_read(c)
+    if reg == 0x0A
+        let v = at(c.regs, 0x0A)
+        c.regs.insert(0x0A, 0)
+        return v
+    if reg == 0x0B
+        var v = 0
+        if fifo_left(c) <= 0
+            v = v | 0x01
+        if fifo_left(c) >= 32
+            v = v | 0x02
+        return v
+    if reg <= 0x05
+        return data_read(c, reg)
+    at(c.regs, reg)
+
+// A soft reset: the configuration registers return to zero, the start-up
+// bits read as not ready for the polls the test set, and the FIFO empties.
+fn chip_reset(c: Chip)
+    for r in [0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B]
+        c.regs.insert(r, 0)
+    c.st.insert(60, at(c.st, 66))
+    c.st.insert(61, 0)
+    c.st.insert(62, 0)
+    c.st.insert(10, at(c.st, 98) / 3)
+
+// A write to a register, which a read-only one ignores.  MEAS_CFG keeps
+// the control field; a measurement on request sets its flag unless the
+// test says it never finishes.
+fn chip_write(c: Chip, reg: Int, v: Int)
+    if at(c.ro, reg) == 1
+        return
+    if reg == 0x08
+        c.regs.insert(0x08, v & 0x07)
+        if at(c.st, 65) == 0
+            if (v & 0x07) == 2
+                c.st.insert(61, 1)
+            if (v & 0x07) == 1 and at(c.st, 68) == 0
+                c.st.insert(62, 1)
+        return
+    if reg == 0x0C
+        if (v & 0x0F) == 0x09
+            chip_reset(c)
+        if (v & 0x80) != 0
+            c.st.insert(10, at(c.st, 98) / 3)
+        return
+    c.regs.insert(reg, v & 0xFF)
+
+struct FakeI2c
+    c: Chip
+
+impl I2cBus for FakeI2c
+    fn init(self, freq: Int) [hw]
+        self.c.st.insert(22, freq)
+
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        log_push(self.c, 1)
+        log_push(self.c, addr)
+        for b in data
+            log_push(self.c, b as Int)
+        log_push(self.c, -1)
+        if addr != at(self.c.st, 70) or at(self.c.st, 4) == 0 or data.len() < 2
+            return false
+        var r = data[0] as Int
+        for i in 1..data.len()
+            chip_write(self.c, r, data[i] as Int)
+            r = r + 1
+        true
+
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        None
+
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        log_push(self.c, 2)
+        log_push(self.c, addr)
+        log_push(self.c, tx[0] as Int)
+        log_push(self.c, n)
+        log_push(self.c, -1)
+        if addr != at(self.c.st, 70) or at(self.c.st, 4) == 0
+            return None
+        var r = tx[0] as Int
+        var out: [u8] = []
+        for _i in 0..n
+            list.push(out, chip_read(self.c, r) as u8)
+            r = r + 1
+        Some(out)
+
+struct FakeSpi
+    c: Chip
+
+impl SpiBus for FakeSpi
+    fn init(self, freq: Int, mode: Int) [hw]
+        self.c.st.insert(20, freq)
+        self.c.st.insert(21, mode)
+
+    fn transfer(self, b: Int) -> Int [hw]
+        if at(self.c.st, 9) == 1
+            log_push(self.c, b)
+        if at(self.c.st, 4) == 0
+            return 0xFF
+        if at(self.c.st, 0) == 0
+            self.c.st.insert(0, 1)
+            self.c.st.insert(1, b & 0x7F)
+            self.c.st.insert(2, (b >> 7) & 1)
+            return 0xFF
+        let r = at(self.c.st, 1)
+        if at(self.c.st, 2) == 1
+            self.c.st.insert(1, (r + 1) & 0x7F)
+            return chip_read(self.c, r)
+        chip_write(self.c, r, b)
+        0xFF
+
+    fn write(self, data: [u8]) [hw]
+        for b in data
+            let _ = self.transfer(b as Int)
+
+    fn read(self, n: Int) -> [u8] [hw]
+        var out: [u8] = []
+        for _i in 0..n
+            list.push(out, self.transfer(0xFF) as u8)
+        out
+
+// The GPIO double: the chip select (pin 67) falling starts an SPI
+// transaction and rising ends it.
+struct FakePins
+    c: Chip
+    levels: HashMap<Int, Int>
+    modes: HashMap<Int, Int>
+
+impl GpioOut for FakePins
+    fn mode(self, pin: Int, dir: Int) [hw]
+        self.modes.insert(pin, dir)
+
+    fn set(self, pin: Int, val: Int) [hw]
+        self.levels.insert(pin, val)
+        if pin == 67 and val == 0
+            self.c.st.insert(0, 0)
+            self.c.st.insert(9, 1)
+            log_push(self.c, 3)
+        if pin == 67 and val == 1 and at(self.c.st, 9) == 1
+            self.c.st.insert(9, 0)
+            log_push(self.c, -1)
+
+    fn get(self, pin: Int) -> Int [hw]
+        at(self.levels, pin)
+
+fn pins(c: Chip) -> FakePins
+    FakePins { c: c, levels: HashMap.new(), modes: HashMap.new() }
+
+// The two ports, as a type that holds a bus implements them: every method
+// is the package's own function over the double.
+struct I2cDut
+    bus: FakeI2c
+    pins: FakePins
+    w: DeviceWiring
+
+impl Dps310Port for I2cDut
+    fn setup(self) -> Bool [hw]
+        dps310.i2c_setup(self.bus, self.pins, self.w)
+
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        dps310.i2c_read_into(self.bus, self.w, reg, n, var dst)
+
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        dps310.i2c_write(self.bus, self.w, reg, v)
+
+    fn irq_level(self) -> Int [hw]
+        dps310.irq_level_of(self.pins, self.w)
+
+    fn irq_mode(self) -> Int [hw]
+        dps310.irq_mode_of(self.w)
+
+struct SpiDut
+    bus: FakeSpi
+    pins: FakePins
+    w: DeviceWiring
+
+impl Dps310Port for SpiDut
+    fn setup(self) -> Bool [hw]
+        dps310.spi_setup(self.bus, self.pins, self.w)
+
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        dps310.spi_read_into(self.bus, self.pins, self.w, reg, n, var dst)
+
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        dps310.spi_write(self.bus, self.pins, self.w, reg, v)
+
+    fn irq_level(self) -> Int [hw]
+        dps310.irq_level_of(self.pins, self.w)
+
+    fn irq_mode(self) -> Int [hw]
+        -1
+
+// A port that refuses one chosen write or one chosen read of a chosen
+// register: `fail` maps a register to the number of the write, counted from
+// 1, that the bus refuses, and `seen` counts the writes; `rfail` and
+// `rseen` do the same for reads.  `quiet` limits the reads of the three
+// FIFO data registers to the number in key 0 once key 1 is 1.  It reaches
+// the refusals that a read-only register cannot.
+struct Flaky
+    inner: I2cDut
+    fail: HashMap<Int, Int>
+    seen: HashMap<Int, Int>
+    rfail: HashMap<Int, Int>
+    rseen: HashMap<Int, Int>
+    quiet: HashMap<Int, Int>
+
+impl Dps310Port for Flaky
+    fn setup(self) -> Bool [hw]
+        self.inner.setup()
+
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        let k = at(self.rseen, reg) + 1
+        self.rseen.insert(reg, k)
+        if at(self.rfail, reg) == k
+            dst.clear()
+            return false
+        if reg == 0x00 and n == 3 and at(self.quiet, 1) == 1
+            if at(self.quiet, 0) == 0
+                dst.clear()
+                return false
+            self.quiet.insert(0, at(self.quiet, 0) - 1)
+        self.inner.read_regs(reg, n, var dst)
+
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        let n = at(self.seen, reg) + 1
+        self.seen.insert(reg, n)
+        if at(self.fail, reg) == n
+            return false
+        self.inner.write_reg(reg, v)
+
+    fn irq_level(self) -> Int [hw]
+        self.inner.irq_level()
+
+    fn irq_mode(self) -> Int [hw]
+        self.inner.irq_mode()
+
+fn flaky(c: Chip, reg: Int, nth: Int) -> Flaky
+    let f = Flaky { inner: i2c_dut(c), fail: HashMap.new(), seen: HashMap.new(), rfail: HashMap.new(), rseen: HashMap.new(), quiet: HashMap.new() }
+    f.fail.insert(reg, nth)
+    f
+
+fn flaky_read(c: Chip, reg: Int, nth: Int) -> Flaky
+    let f = Flaky { inner: i2c_dut(c), fail: HashMap.new(), seen: HashMap.new(), rfail: HashMap.new(), rseen: HashMap.new(), quiet: HashMap.new() }
+    f.rfail.insert(reg, nth)
+    f
+
+// The board's wiring: the part at 0x77 on I2C, the interrupt on pin 65.
+fn i2c_wiring() -> DeviceWiring
+    dev_bus.wiring_irq(dev_bus.wiring_i2c(0, 0x77), 65)
+
+// The part on SPI: chip select on pin 67.
+fn spi_wiring() -> DeviceWiring
+    dev_bus.wiring_spi(0, 67)
+
+fn i2c_dut(c: Chip) -> I2cDut
+    I2cDut { bus: FakeI2c { c: c }, pins: pins(c), w: i2c_wiring() }
+
+fn spi_dut(c: Chip) -> SpiDut
+    SpiDut { bus: FakeSpi { c: c }, pins: pins(c), w: spi_wiring() }
+
+// Asserts the log holds exactly `want`, then empties it.
+fn log_is(c: Chip, want: [Int])
+    test.assert_eq(at(c.st, 99), want.len())
+    for i in 0..want.len()
+        test.assert_eq(at(c.log, i), want[i])
+    log_clear(c)
+
+fn reg_of(c: Chip, r: Int) -> Int
+    at(c.regs, r)
+
+// Stores a 24-bit count, most significant byte first, at `reg`.
+fn put24(c: Chip, reg: Int, v: Int)
+    let u = v & 0xFFFFFF
+    c.regs.insert(reg, u >> 16)
+    c.regs.insert(reg + 1, (u >> 8) & 0xFF)
+    c.regs.insert(reg + 2, u & 0xFF)
+
+// Sets the pressure and temperature counts and the two configuration
+// registers' oversampling codes.
+fn put_results(c: Chip, raw_p: Int, osr_p: Int, raw_t: Int, osr_t: Int)
+    put24(c, 0x00, raw_p)
+    put24(c, 0x03, raw_t)
+    c.regs.insert(0x06, osr_p)
+    c.regs.insert(0x07, osr_t)
+
+// Appends a 24-bit word to the FIFO.
+fn fifo_push(c: Chip, v: Int)
+    let u = v & 0xFFFFFF
+    let n = at(c.st, 98)
+    c.fifo.insert(n, u >> 16)
+    c.fifo.insert(n + 1, (u >> 8) & 0xFF)
+    c.fifo.insert(n + 2, u & 0xFF)
+    c.st.insert(98, n + 3)
+
+fn sample_of(o: ?Dps310Sample) -> [Int]
+    match o
+        Some(s) => [s.milli_c, s.milli_pa]
+        None    => [-99999, -99999]
+
+// The coefficients the test part holds, as `cal_of` decodes them.
+fn test_cal() -> Dps310Cal
+    Dps310Cal { c0: 175, c1: -2000, c00: 126653, c10: -55000, c01: -1700, c11: -1000, c20: 10000, c21: -1200, c30: -2000 }
+
+fn bytes_of(l: [Int]) -> DevBytes
+    var b: DevBytes = Vec.new()
+    for x in l
+        let _ = b.push(x as u8)
+    b
+
+// ── The two buses' framing ───────────────────────────────────────────
+
+@test
+fn test_an_i2c_read_is_the_register_and_a_repeated_start_for_any_count() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert_eq(dps310.reg_read(d, 0x0D) ?? -1, 0x10)
+    log_is(c, [2, 0x77, 0x0D, 1, -1])
+    c.regs.insert(0x06, 11)
+    c.regs.insert(0x07, 22)
+    var b: DevBytes = Vec.new()
+    test.assert(d.read_regs(0x06, 2, var b))
+    log_is(c, [2, 0x77, 0x06, 2, -1])
+    test.assert_eq(b[0] as Int, 11)
+    test.assert_eq(b[1] as Int, 22)
+
+@test
+fn test_an_i2c_write_is_the_register_then_the_byte() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(d.write_reg(0x06, 0x23))
+    log_is(c, [1, 0x77, 0x06, 0x23, -1])
+    test.assert_eq(reg_of(c, 0x06), 0x23)
+
+@test
+fn test_a_missing_i2c_part_does_not_answer() [io, hw]
+    let c = chip()
+    c.st.insert(4, 0)
+    let d = i2c_dut(c)
+    test.assert(dps310.reg_read(d, 0x0D) == None)
+    test.assert(not d.write_reg(0x06, 1))
+    test.assert(not dps310.reg_write(d, 0x06, 1))
+    test.assert(not dps310.reg_update(d, 0x06, 1, 1))
+    test.assert(dps310.id_read(d) == None)
+
+@test
+fn test_an_spi_read_sets_rw_and_carries_no_mb_bit_or_dummy_byte() [io, hw]
+    let c = chip()
+    let d = spi_dut(c)
+    test.assert_eq(dps310.reg_read(d, 0x0D) ?? -1, 0x10)
+    log_is(c, [3, 0x8D, 0xFF, -1])
+    test.assert_eq(at(d.pins.levels, 67), 1)
+    c.regs.insert(0x06, 11)
+    c.regs.insert(0x07, 22)
+    c.regs.insert(0x08, 33)
+    var b: DevBytes = Vec.new()
+    // The address advances on its own and the first byte out is data.
+    test.assert(d.read_regs(0x06, 3, var b))
+    log_is(c, [3, 0x86, 0xFF, 0xFF, 0xFF, -1])
+    test.assert_eq(b[0] as Int, 11)
+    test.assert_eq(b[1] as Int, 22)
+    test.assert_eq(b.len(), 3)
+
+@test
+fn test_an_spi_write_clears_rw() [io, hw]
+    let c = chip()
+    let d = spi_dut(c)
+    test.assert(d.write_reg(0x06, 0x23))
+    log_is(c, [3, 0x06, 0x23, -1])
+    test.assert_eq(reg_of(c, 0x06), 0x23)
+
+@test
+fn test_an_spi_part_that_is_not_there_reads_0xff_and_is_no_part() [io, hw]
+    let c = chip()
+    c.st.insert(4, 0)
+    let d = spi_dut(c)
+    test.assert_eq(dps310.reg_read(d, 0x0D) ?? -1, 0xFF)
+    test.assert(dps310.id_read(d) == None)
+    c.st.insert(4, 1)
+    c.regs.insert(0x0D, 0)
+    test.assert(dps310.id_read(d) == None)
+
+@test
+fn test_a_wiring_with_no_chip_select_runs_no_spi_transaction() [io, hw]
+    let c = chip()
+    let d = SpiDut { bus: FakeSpi { c: c }, pins: pins(c), w: dev_bus.wiring_i2c(0, 0x77) }
+    var b: DevBytes = Vec.new()
+    test.assert(not d.read_regs(0x0D, 1, var b))
+    test.assert(not d.write_reg(0x06, 1))
+    test.assert(not d.setup())
+    test.assert_eq(at(c.st, 99), 0)
+
+@test
+fn test_a_wiring_with_no_address_is_not_an_i2c_part() [io, hw]
+    let c = chip()
+    let d = I2cDut { bus: FakeI2c { c: c }, pins: pins(c), w: dev_bus.wiring_spi(0, 67) }
+    test.assert(not d.setup())
+    test.assert_eq(at(c.st, 99), 0)
+
+// ── Setup ────────────────────────────────────────────────────────────
+
+@test
+fn test_i2c_setup_makes_the_interrupt_pin_an_input_and_the_bus_fast() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(d.setup())
+    test.assert_eq(at(c.st, 22), 400000)
+    test.assert_eq(at(d.pins.modes, 65), 0)
+
+@test
+fn test_spi_setup_drives_chip_select_high_before_it_is_an_output() [io, hw]
+    let c = chip()
+    let d = spi_dut(c)
+    test.assert(d.setup())
+    test.assert_eq(at(d.pins.levels, 67), 1)
+    test.assert_eq(at(d.pins.modes, 67), 1)
+    test.assert_eq(at(c.st, 20), 4000000)
+    test.assert_eq(at(c.st, 21), 3)
+
+@test
+fn test_the_interrupt_line_level() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    d.pins.levels.insert(65, 1)
+    test.assert_eq(d.irq_level(), 1)
+    test.assert_eq(dps310.irq_level_of(d.pins, dev_bus.wiring_i2c(0, 0x77)), -1)
+    let s = spi_dut(c)
+    test.assert_eq(s.irq_level(), -1)
+
+@test
+fn test_the_interrupt_polarity_is_the_opposite_of_the_address_strap() [io, hw]
+    // Section 4.6: with SDO pulled low (0x76) the interrupt must be active
+    // high; with SDO high (0x77), active low.  No pin, no interrupt.
+    test.assert_eq(dps310.irq_mode_of(dev_bus.wiring_irq(dev_bus.wiring_i2c(0, 0x76), 5)), 1)
+    test.assert_eq(dps310.irq_mode_of(dev_bus.wiring_irq(dev_bus.wiring_i2c(0, 0x77), 5)), 0)
+    test.assert_eq(dps310.irq_mode_of(dev_bus.wiring_i2c(0, 0x76)), -1)
+    test.assert_eq(dps310.irq_mode_of(dev_bus.wiring_irq(dev_bus.wiring_spi(0, 67), 5)), 0)
+    let c = chip()
+    test.assert_eq(i2c_dut(c).irq_mode(), 0)
+    test.assert_eq(spi_dut(c).irq_mode(), -1)
+
+// ── Identity ─────────────────────────────────────────────────────────
+
+@test
+fn test_the_identity_is_id_with_its_revision_nibble_on_both_buses() [io, hw]
+    let c = chip()
+    match dps310.id_read(i2c_dut(c))
+        Some(id) =>
+            test.assert_eq(id.who, 0x10)
+            test.assert(id.rev == Some(1))
+        None => test.assert(false)
+    match dps310.id_read(spi_dut(c))
+        Some(id) => test.assert_eq(id.who, 0x10)
+        None     => test.assert(false)
+
+// ── The coefficients and the conversion ──────────────────────────────
+
+@test
+fn test_the_coefficients_are_decoded_across_bytes_as_table_18_packs_them() [io, hw]
+    let cal = dps310.cal_of(bytes_of(cal_bytes()))
+    test.assert_eq(cal.c0, 175)
+    test.assert_eq(cal.c1, -2000)
+    test.assert_eq(cal.c00, 126653)
+    test.assert_eq(cal.c10, -55000)
+    test.assert_eq(cal.c01, -1700)
+    test.assert_eq(cal.c11, -1000)
+    test.assert_eq(cal.c20, 10000)
+    test.assert_eq(cal.c21, -1200)
+    test.assert_eq(cal.c30, -2000)
+
+@test
+fn test_the_coefficients_at_the_ends_of_their_widths() [io, hw]
+    // All ones is -1 at every width.
+    var ones: [Int] = []
+    for _i in 0..18
+        list.push(ones, 0xFF)
+    let m = dps310.cal_of(bytes_of(ones))
+    test.assert_eq(m.c0, -1)
+    test.assert_eq(m.c1, -1)
+    test.assert_eq(m.c00, -1)
+    test.assert_eq(m.c10, -1)
+    test.assert_eq(m.c30, -1)
+    // The largest values: 12-bit 2047, 20-bit 524287, 16-bit 32767.
+    let hi = dps310.cal_of(bytes_of([0x7F, 0xF7, 0xFF, 0x7F, 0xFF, 0xF7, 0xFF, 0xFF, 0x7F, 0xFF, 0x7F, 0xFF, 0x7F, 0xFF, 0x7F, 0xFF, 0x7F, 0xFF]))
+    test.assert_eq(hi.c0, 2047)
+    test.assert_eq(hi.c1, 2047)
+    test.assert_eq(hi.c00, 524287)
+    test.assert_eq(hi.c10, 524287)
+    test.assert_eq(hi.c01, 32767)
+    test.assert_eq(hi.c21, 32767)
+    // The smallest: 12-bit -2048, 20-bit -524288, 16-bit -32768.
+    let lo = dps310.cal_of(bytes_of([0x80, 0x08, 0x00, 0x80, 0x00, 0x08, 0x00, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00]))
+    test.assert_eq(lo.c0, -2048)
+    test.assert_eq(lo.c1, -2048)
+    test.assert_eq(lo.c00, -524288)
+    test.assert_eq(lo.c10, -524288)
+    test.assert_eq(lo.c30, -32768)
+
+@test
+fn test_the_coefficients_are_read_in_one_burst_of_18_bytes_from_0x10() [io, hw]
+    let c = chip()
+    log_clear(c)
+    match dps310.cal_read(i2c_dut(c))
+        Some(cal) =>
+            test.assert_eq(cal.c0, 175)
+            test.assert_eq(cal.c30, -2000)
+            test.assert_eq(cal.c00, 126653)
+        None      => test.assert(false)
+    log_is(c, [2, 0x77, 0x10, 18, -1])
+    c.st.insert(4, 0)
+    test.assert(dps310.cal_read(i2c_dut(c)) == None)
+
+@test
+fn test_the_scale_factors_are_table_9s() [io, hw]
+    test.assert_eq(dps310.scale_of(0), 524288)
+    test.assert_eq(dps310.scale_of(1), 1572864)
+    test.assert_eq(dps310.scale_of(2), 3670016)
+    test.assert_eq(dps310.scale_of(3), 7864320)
+    test.assert_eq(dps310.scale_of(4), 253952)
+    test.assert_eq(dps310.scale_of(5), 516096)
+    test.assert_eq(dps310.scale_of(6), 1040384)
+    test.assert_eq(dps310.scale_of(7), 2088960)
+    // Only the code's three bits count; PM_PRC has a fourth that is 0.
+    test.assert_eq(dps310.scale_of(0x0B), 7864320)
+
+@test
+fn test_the_conversion_times_are_table_16s_plus_a_fifth() [io, hw]
+    test.assert_eq(dps310.typical_us(0), 3600)
+    test.assert_eq(dps310.typical_us(1), 5200)
+    test.assert_eq(dps310.typical_us(2), 8400)
+    test.assert_eq(dps310.typical_us(3), 14800)
+    test.assert_eq(dps310.typical_us(4), 27600)
+    test.assert_eq(dps310.typical_us(5), 53200)
+    test.assert_eq(dps310.typical_us(6), 104400)
+    test.assert_eq(dps310.typical_us(7), 206800)
+    test.assert_eq(dps310.conversion_us(0), 4320)
+    test.assert_eq(dps310.conversion_us(3), 17760)
+    test.assert_eq(dps310.conversion_us(7), 248160)
+
+// The worked numbers.  The data sheet prints the formulas (sections 4.9.1
+// and 4.9.2) and Table 9's scale factors, and no numeric example, so the
+// vectors are computed here by hand from the formulas for a part whose
+// coefficients are chosen to land near sea level.
+//
+// The test part: c0 = 175, c1 = -2000, c00 = 126653, c10 = -55000,
+// c01 = -1700, c11 = -1000, c20 = 10000, c21 = -1200, c30 = -2000.
+//
+// Vector 1, both measurements at 8 times, so kP = kT = 7864320:
+//   Traw = 245760    Traw_sc = 245760 / 7864320  = 1/32 = 0.03125
+//   Praw = 3932160   Praw_sc = 3932160 / 7864320 = 1/2  = 0.5
+//   Tcomp = 175 * 0.5 + (-2000) * 0.03125 = 87.5 - 62.5 = 25 °C
+//   Pcomp = 126653
+//         + 0.5 * (-55000 + 0.5 * (10000 + 0.5 * (-2000)))
+//         + 0.03125 * (-1700)
+//         + 0.03125 * 0.5 * (-1000 + 0.5 * (-1200))
+//   The first bracket is 10000 - 1000 = 9000, the second -55000 + 4500 =
+//   -50500, so the second line is -25250.  The third line is -53.125 and
+//   the fourth 0.015625 * (-1600) = -25.  The sum is 126653 - 25250 -
+//   53.125 - 25 = 101324.875 Pa.  Every term is a multiple of a power of
+//   two, so binary64 holds it exactly.
+//
+// The other vectors come from a separate transcription of the same
+// formulas in Python (binary64, the same order of operations):
+//   Vector 2: Praw = 520192 at 64 times (kP = 1040384), Traw = 11640 at 16
+//     times (kT = 253952): -4.170866935483872 °C and 101288.41141633064 Pa.
+//   Vector 3: Praw = -1500000 and Traw = -8000, both at 1 time (kP = kT =
+//     524288), which exercises the sign of both counts:
+//     118.017578125 °C and 412833.4835220141 Pa.
+//   Vector 4: Praw = 1000000 and Traw = 100000, both at 128 times
+//     (2088960): -8.241421568627459 °C and 102278.85215515667 Pa.
+
+@test
+fn test_the_worked_numbers() [io, hw]
+    let cal = test_cal()
+    test.assert(dps310.temperature_c(cal, 245760, 3) == 25.0)
+    test.assert(dps310.pressure_pa(cal, 3932160, 3, 245760, 3) == 101324.875)
+    test.assert_eq(dps310.round_to_int(dps310.temperature_c(cal, 245760, 3) * 1000.0), 25000)
+    test.assert_eq(dps310.round_to_int(dps310.pressure_pa(cal, 3932160, 3, 245760, 3) * 1000.0), 101324875)
+    // Vector 2.
+    test.assert_eq(dps310.round_to_int(dps310.temperature_c(cal, 11640, 4) * 1000.0), -4171)
+    test.assert_eq(dps310.round_to_int(dps310.pressure_pa(cal, 520192, 6, 11640, 4) * 1000.0), 101288411)
+    // Vector 3.
+    test.assert_eq(dps310.round_to_int(dps310.temperature_c(cal, -8000, 0) * 1000.0), 118018)
+    test.assert_eq(dps310.round_to_int(dps310.pressure_pa(cal, -1500000, 0, -8000, 0) * 1000.0), 412833484)
+    // Vector 4.
+    test.assert_eq(dps310.round_to_int(dps310.temperature_c(cal, 100000, 7) * 1000.0), -8241)
+    test.assert_eq(dps310.round_to_int(dps310.pressure_pa(cal, 1000000, 7, 100000, 7) * 1000.0), 102278852)
+
+@test
+fn test_rounding_is_to_the_nearest_with_halves_away_from_zero() [io, hw]
+    test.assert_eq(dps310.round_to_int(2.5), 3)
+    test.assert_eq(dps310.round_to_int(2.4), 2)
+    test.assert_eq(dps310.round_to_int(-2.5), -3)
+    test.assert_eq(dps310.round_to_int(-2.4), -2)
+    test.assert_eq(dps310.pa_of_milli_pa(101324875), 101325)
+    test.assert_eq(dps310.pa_of_milli_pa(101324499), 101324)
+    test.assert_eq(dps310.pa_of_milli_pa(-1500), -2)
+    test.assert_eq(dps310.pa_of_milli_pa(-1499), -1)
+
+@test
+fn test_a_count_is_a_result_unless_it_is_zero_or_0x800000() [io, hw]
+    test.assert(dps310.raw_valid(1))
+    test.assert(dps310.raw_valid(-1))
+    test.assert(not dps310.raw_valid(0))
+    test.assert(not dps310.raw_valid(-8388608))
+
+// ── Samples ──────────────────────────────────────────────────────────
+
+@test
+fn test_a_sample_is_one_burst_of_eight_registers_and_converted_at_its_oversampling() [io, hw]
+    let c = chip()
+    put_results(c, 3932160, 3, 245760, 3)
+    let d = i2c_dut(c)
+    log_clear(c)
+    let s = dps310.measure(d, test_cal())
+    test.assert_eq(sample_of(s)[0], 25000)
+    test.assert_eq(sample_of(s)[1], 101324875)
+    log_is(c, [2, 0x77, 0x00, 8, -1])
+    // The same part at another oversampling is converted at that one.
+    put_results(c, 520192, 6, 11640, 4)
+    test.assert_eq(sample_of(dps310.measure(d, test_cal()))[1], 101288411)
+    put_results(c, -1500000, 0, -8000, 0)
+    test.assert_eq(sample_of(dps310.measure(d, test_cal()))[0], 118018)
+
+@test
+fn test_a_sample_over_spi_is_the_same_burst() [io, hw]
+    let c = chip()
+    put_results(c, 3932160, 3, 245760, 3)
+    let d = spi_dut(c)
+    log_clear(c)
+    test.assert_eq(sample_of(dps310.measure(d, test_cal()))[1], 101324875)
+    log_is(c, [3, 0x80, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, -1])
+
+@test
+fn test_no_result_before_the_first_measurement_or_after_the_fifo_runs_dry() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    // The registers read 0 until the first measurement.
+    test.assert(dps310.measure(d, test_cal()) == None)
+    put_results(c, 3932160, 3, 0, 3)
+    test.assert(dps310.measure(d, test_cal()) == None)
+    put_results(c, 0, 3, 245760, 3)
+    test.assert(dps310.measure(d, test_cal()) == None)
+    put_results(c, -8388608, 3, 245760, 3)
+    test.assert(dps310.measure(d, test_cal()) == None)
+    c.st.insert(4, 0)
+    test.assert(dps310.measure(d, test_cal()) == None)
+    test.assert(dps310.sample_read(d) == None)
+    test.assert(not dps310.data_ready(d))
+
+@test
+fn test_a_temperature_alone_needs_only_a_temperature() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(dps310.measure_temp(d, test_cal()) == None)
+    put_results(c, 0, 3, 245760, 3)
+    test.assert(dps310.measure_temp(d, test_cal()) == Some(25000))
+    put_results(c, 0, 3, 11640, 4)
+    test.assert(dps310.measure_temp(d, test_cal()) == Some(-4171))
+    c.st.insert(4, 0)
+    test.assert(dps310.measure_temp(d, test_cal()) == None)
+
+@test
+fn test_a_sample_with_the_coefficients_read_first() [io, hw]
+    let c = chip()
+    put_results(c, 3932160, 3, 245760, 3)
+    let d = i2c_dut(c)
+    log_clear(c)
+    test.assert_eq(sample_of(dps310.sample_read(d))[1], 101324875)
+    log_is(c, [2, 0x77, 0x10, 18, -1, 2, 0x77, 0x00, 8, -1])
+    test.assert(dps310.baro_read_of(d) == Some(Pascals { pa: 101325 }))
+    test.assert(dps310.temp_read_of(d) == Some(TempMilliC { milli_c: 25000 }))
+    c.st.insert(4, 0)
+    test.assert(dps310.baro_read_of(d) == None)
+    test.assert(dps310.temp_read_of(d) == None)
+    let e = chip()
+    test.assert(dps310.temp_read_of(i2c_dut(e)) == None)
+    test.assert(dps310.baro_read_of(i2c_dut(e)) == None)
+
+@test
+fn test_ready_needs_a_pressure_and_a_temperature_and_reading_clears_them() [io, hw]
+    let c = chip()
+    c.st.insert(60, 0)
+    let d = i2c_dut(c)
+    test.assert(not dps310.data_ready(d))
+    c.st.insert(62, 1)
+    test.assert(not dps310.data_ready(d))
+    c.st.insert(61, 1)
+    test.assert(dps310.data_ready(d))
+    put_results(c, 3932160, 3, 245760, 3)
+    let _ = dps310.measure(d, test_cal())
+    test.assert(not dps310.data_ready(d))
+
+@test
+fn test_the_interrupt_status_is_read_to_lower_the_line() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x0A, 0x01)
+    test.assert_eq(dps310.irq_clear(d), 0x01)
+    test.assert_eq(dps310.irq_clear(d), 0)
+    c.st.insert(4, 0)
+    test.assert_eq(dps310.irq_clear(d), -1)
+
+// ── Modes ────────────────────────────────────────────────────────────
+
+@test
+fn test_a_mode_goes_through_standby_and_is_read_back() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(dps310.mode_start(d, 7))
+    test.assert_eq(reg_of(c, 0x08), 7)
+    // Standby first, then the mode: the Linux driver's fix.  A command
+    // mode ends by itself and is not read back.
+    log_clear(c)
+    test.assert(dps310.mode_start(d, 2))
+    log_is(c, [1, 0x77, 0x08, 0x00, -1, 2, 0x77, 0x08, 1, -1, 1, 0x77, 0x08, 0x02, -1])
+    test.assert(dps310.standby(d))
+    test.assert_eq(reg_of(c, 0x08), 0)
+    test.assert(dps310.run_background(d))
+    test.assert_eq(reg_of(c, 0x08), 7)
+
+@test
+fn test_a_mode_the_part_does_not_hold_is_refused() [io, hw]
+    let c = chip()
+    c.regs.insert(0x08, 3)
+    c.ro.insert(0x08, 1)
+    let d = i2c_dut(c)
+    test.assert(not dps310.meas_write(d, 7))
+    test.assert(not dps310.mode_start(d, 7))
+    let e = chip()
+    e.st.insert(4, 0)
+    test.assert(not dps310.meas_write(i2c_dut(e), 0))
+    // The second write is the one the part refuses.
+    let f = flaky(chip(), 0x08, 2)
+    test.assert(not dps310.mode_start(f, 2))
+
+@test
+fn test_a_pressure_in_standby_is_started_and_its_time_answered() [io, hw]
+    let c = chip()
+    c.regs.insert(0x06, 0x03)
+    c.regs.insert(0x07, 0x05)
+    let d = i2c_dut(c)
+    log_clear(c)
+    test.assert_eq(dps310.pressure_start(d), 17760)
+    test.assert_eq(reg_of(c, 0x08), 1)
+    test.assert_eq(at(c.st, 62), 1)
+    test.assert_eq(dps310.temperature_start(d), 63840)
+    test.assert_eq(reg_of(c, 0x08), 2)
+    test.assert_eq(at(c.st, 61), 1)
+
+@test
+fn test_a_part_in_background_mode_converts_by_itself() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    for m in [5, 7]
+        c.regs.insert(0x08, m)
+        log_clear(c)
+        test.assert_eq(dps310.pressure_start(d), 0)
+        log_is(c, [2, 0x77, 0x06, 3, -1])
+    for m in [6, 7]
+        c.regs.insert(0x08, m)
+        log_clear(c)
+        test.assert_eq(dps310.temperature_start(d), 0)
+        log_is(c, [2, 0x77, 0x06, 3, -1])
+    // A background mode that does not measure the quantity is restarted.
+    c.regs.insert(0x08, 6)
+    test.assert_eq(dps310.pressure_start(d), 4320)
+    test.assert_eq(reg_of(c, 0x08), 1)
+    c.regs.insert(0x08, 5)
+    test.assert_eq(dps310.temperature_start(d), 4320)
+    test.assert_eq(reg_of(c, 0x08), 2)
+
+@test
+fn test_a_start_the_part_does_not_take_answers_minus_one() [io, hw]
+    let c = chip()
+    c.st.insert(4, 0)
+    test.assert_eq(dps310.pressure_start(i2c_dut(c)), -1)
+    test.assert_eq(dps310.temperature_start(i2c_dut(c)), -1)
+    let e = chip()
+    e.regs.insert(0x08, 3)
+    e.ro.insert(0x08, 1)
+    test.assert_eq(dps310.pressure_start(i2c_dut(e)), -1)
+    test.assert_eq(dps310.temperature_start(i2c_dut(e)), -1)
+
+@test
+fn test_one_measurement_on_request_waits_by_polling_and_ends_in_standby() [io, hw]
+    let c = chip()
+    c.st.insert(60, 0)
+    let d = i2c_dut(c)
+    put_results(c, 3932160, 3, 245760, 3)
+    test.assert_eq(sample_of(dps310.measure_once(d, test_cal()))[1], 101324875)
+    // The temperature was asked for first, then the pressure.
+    test.assert_eq(reg_of(c, 0x08), 1)
+
+@test
+fn test_a_measurement_on_request_that_never_finishes_gives_nothing() [io, hw]
+    let c = chip()
+    c.st.insert(65, 1)
+    c.st.insert(67, 1)
+    put_results(c, 3932160, 3, 245760, 3)
+    test.assert(dps310.measure_once(i2c_dut(c), test_cal()) == None)
+    // The temperature arrives and the pressure never does.
+    let e = chip()
+    e.st.insert(67, 1)
+    e.st.insert(68, 1)
+    put_results(e, 3932160, 3, 245760, 3)
+    test.assert(dps310.measure_once(i2c_dut(e), test_cal()) == None)
+    // The pressure mode is not taken.
+    let f = flaky(chip(), 0x08, 4)
+    test.assert(dps310.measure_once(f, test_cal()) == None)
+    let g = flaky(chip(), 0x08, 2)
+    test.assert(dps310.measure_once(g, test_cal()) == None)
+    let h = flaky(chip(), 0x08, 3)
+    test.assert(dps310.measure_once(h, test_cal()) == None)
+
+// ── Settings ─────────────────────────────────────────────────────────
+
+@test
+fn test_oversampling_sets_the_shifts_an_oversampling_above_8_times_needs() [io, hw]
+    let c = chip()
+    c.regs.insert(0x06, 0x20)
+    c.regs.insert(0x07, 0x40)
+    let d = i2c_dut(c)
+    test.assert(dps310.osr_write(d, 6, 3))
+    test.assert_eq(reg_of(c, 0x06), 0x26)
+    test.assert_eq(reg_of(c, 0x07), 0x43)
+    test.assert_eq(reg_of(c, 0x09), 0x04)
+    test.assert(dps310.osr_write(d, 3, 5))
+    test.assert_eq(reg_of(c, 0x09), 0x08)
+    test.assert(dps310.osr_write(d, 7, 7))
+    test.assert_eq(reg_of(c, 0x09), 0x0C)
+    test.assert(dps310.osr_write(d, 0, 0))
+    test.assert_eq(reg_of(c, 0x09), 0x00)
+    test.assert_eq(reg_of(c, 0x06), 0x20)
+    // The other bits of CFG_REG stay.
+    c.regs.insert(0x09, 0x90)
+    test.assert(dps310.osr_write(d, 4, 4))
+    test.assert_eq(reg_of(c, 0x09), 0x9C)
+
+@test
+fn test_oversampling_is_refused_outside_standby_or_outside_its_codes() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    log_clear(c)
+    test.assert(not dps310.osr_write(d, 8, 0))
+    test.assert(not dps310.osr_write(d, 0, 8))
+    test.assert(not dps310.osr_write(d, -1, 0))
+    test.assert(not dps310.osr_write(d, 0, -1))
+    test.assert_eq(at(c.st, 99), 0)
+    c.regs.insert(0x08, 7)
+    test.assert(not dps310.osr_write(d, 3, 3))
+    log_is(c, [2, 0x77, 0x08, 1, -1])
+    test.assert_eq(reg_of(c, 0x06), 0)
+
+@test
+fn test_oversampling_refusals_by_register() [io, hw]
+    for r in [0x06, 0x07, 0x09]
+        let c = chip()
+        c.ro.insert(r, 1)
+        test.assert(not dps310.osr_write(i2c_dut(c), 6, 6))
+
+@test
+fn test_rates_fit_when_the_two_measurements_take_under_a_second() [io, hw]
+    // 4 a second at 8 times: 4 * 14.8 ms + 4 * 14.8 ms = 118 ms.
+    test.assert(dps310.rates_fit(2, 3, 2, 3))
+    // 128 a second at 8 times is 1.9 s of pressure alone.
+    test.assert(not dps310.rates_fit(7, 3, 0, 0))
+    // 128 a second at 1 time is 460.8 ms, and with 128 temperatures a
+    // second at 1 time another 460.8 ms: just under a second.
+    test.assert(dps310.rates_fit(7, 0, 7, 0))
+    // Table 16: one measurement per second at 128 times is 206.8 ms.
+    test.assert(dps310.rates_fit(0, 7, 0, 7))
+    test.assert(not dps310.rates_fit(2, 7, 2, 7))
+    test.assert(not dps310.rates_fit(7, 1, 7, 0))
+
+@test
+fn test_rates_are_written_to_the_rate_bits_alone() [io, hw]
+    let c = chip()
+    c.regs.insert(0x06, 0x03)
+    c.regs.insert(0x07, 0x83)
+    let d = i2c_dut(c)
+    test.assert(dps310.rate_write(d, 3, 1))
+    test.assert_eq(reg_of(c, 0x06), 0x33)
+    test.assert_eq(reg_of(c, 0x07), 0x93)
+
+@test
+fn test_rates_are_refused_outside_standby_outside_their_codes_or_over_budget() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    log_clear(c)
+    test.assert(not dps310.rate_write(d, 8, 0))
+    test.assert(not dps310.rate_write(d, 0, 8))
+    test.assert(not dps310.rate_write(d, -1, 0))
+    test.assert(not dps310.rate_write(d, 0, -1))
+    test.assert_eq(at(c.st, 99), 0)
+    c.regs.insert(0x08, 5)
+    test.assert(not dps310.rate_write(d, 1, 1))
+    c.regs.insert(0x08, 0)
+    c.regs.insert(0x06, 0x03)
+    c.regs.insert(0x07, 0x03)
+    // 128 pressures a second at 8 times does not fit.
+    test.assert(not dps310.rate_write(d, 7, 0))
+    test.assert_eq(reg_of(c, 0x06), 0x03)
+    c.st.insert(4, 0)
+    test.assert(not dps310.rate_write(d, 1, 1))
+
+@test
+fn test_rate_refusals_by_register() [io, hw]
+    for r in [0x06, 0x07]
+        let c = chip()
+        c.ro.insert(r, 1)
+        test.assert(not dps310.rate_write(i2c_dut(c), 2, 2))
+    // A part that answers MEAS_CFG and then the two configuration
+    // registers no more.
+    let e = chip()
+    let f = flaky_read(e, 0x06, 1)
+    test.assert(not dps310.rate_write(f, 2, 2))
+
+// ── The FIFO ─────────────────────────────────────────────────────────
+
+@test
+fn test_fifo_start_flushes_then_enables_and_swaps_the_interrupt() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x09, 0x10)
+    log_clear(c)
+    test.assert(dps310.fifo_start(d))
+    test.assert_eq(reg_of(c, 0x09), 0x42)
+    // The flush comes first.
+    test.assert_eq(at(c.log, 0), 1)
+    test.assert_eq(at(c.log, 2), 0x0C)
+    test.assert_eq(at(c.log, 3), 0x80)
+    test.assert(dps310.fifo_stop(d))
+    test.assert_eq(reg_of(c, 0x09), 0x10)
+
+@test
+fn test_fifo_on_a_bus_without_an_interrupt_touches_only_fifo_en() [io, hw]
+    let c = chip()
+    let d = spi_dut(c)
+    c.regs.insert(0x09, 0x04)
+    test.assert(dps310.fifo_start(d))
+    test.assert_eq(reg_of(c, 0x09), 0x06)
+    test.assert(dps310.fifo_stop(d))
+    test.assert_eq(reg_of(c, 0x09), 0x04)
+
+@test
+fn test_the_fifo_refusals() [io, hw]
+    let c = chip()
+    test.assert(not dps310.fifo_start(flaky(c, 0x0C, 1)))
+    let e = chip()
+    e.regs.insert(0x09, 0x10)
+    e.ro.insert(0x09, 1)
+    test.assert(not dps310.fifo_start(i2c_dut(e)))
+    let f = chip()
+    f.regs.insert(0x09, 0x42)
+    f.ro.insert(0x09, 1)
+    test.assert(not dps310.fifo_stop(i2c_dut(f)))
+    // The flush at the end of a stop.
+    let g = chip()
+    test.assert(not dps310.fifo_stop(flaky(g, 0x0C, 1)))
+
+@test
+fn test_the_fifo_is_drained_oldest_first_and_each_pressure_takes_the_latest_temperature() [io, hw]
+    // Words: a temperature (LSB 0) and a pressure (LSB 1) at 8 times, the
+    // first temperature 25 °C, the second 20.8 °C.
+    let c = chip()
+    c.regs.insert(0x06, 0x03)
+    c.regs.insert(0x07, 0x03)
+    c.regs.insert(0x09, 0x02)
+    fifo_push(c, 245760)
+    fifo_push(c, 3932161)
+    fifo_push(c, 3932163)
+    fifo_push(c, 262144)
+    fifo_push(c, 3932165)
+    let d = i2c_dut(c)
+    var press: Vec[Int; 32] = Vec.new()
+    var temp: Vec[Int; 32] = Vec.new()
+    test.assert_eq(dps310.fifo_read(d, test_cal(), var press, var temp), 5)
+    test.assert_eq(temp.len(), 2)
+    test.assert_eq(temp[0], 25000)
+    test.assert_eq(temp[1], 20833)
+    test.assert_eq(press.len(), 3)
+    test.assert_eq(press[0], 101324869)
+    test.assert_eq(press[1], 101324857)
+    // The last pressure follows the second temperature.
+    test.assert_eq(press[2], 101319637)
+    // The FIFO is empty, and reads 0x800000.
+    test.assert_eq(dps310.fifo_read(d, test_cal(), var press, var temp), 0)
+    test.assert_eq(press.len(), 0)
+    test.assert_eq(temp.len(), 0)
+
+@test
+fn test_a_pressure_before_the_first_temperature_takes_the_first_one() [io, hw]
+    let c = chip()
+    c.regs.insert(0x06, 0x03)
+    c.regs.insert(0x07, 0x03)
+    c.regs.insert(0x09, 0x02)
+    fifo_push(c, 3932161)
+    fifo_push(c, 245760)
+    fifo_push(c, 3932163)
+    let d = i2c_dut(c)
+    var press: Vec[Int; 32] = Vec.new()
+    var temp: Vec[Int; 32] = Vec.new()
+    test.assert_eq(dps310.fifo_read(d, test_cal(), var press, var temp), 3)
+    test.assert_eq(press.len(), 2)
+    test.assert_eq(press[0], 101324869)
+    test.assert_eq(press[1], 101324857)
+    test.assert_eq(temp[0], 25000)
+
+@test
+fn test_pressures_with_no_temperature_in_the_batch_are_dropped() [io, hw]
+    let c = chip()
+    c.regs.insert(0x09, 0x02)
+    fifo_push(c, 3932161)
+    fifo_push(c, 3932163)
+    let d = i2c_dut(c)
+    var press: Vec[Int; 32] = Vec.new()
+    var temp: Vec[Int; 32] = Vec.new()
+    test.assert_eq(dps310.fifo_read(d, test_cal(), var press, var temp), 2)
+    test.assert_eq(press.len(), 0)
+    test.assert_eq(temp.len(), 0)
+
+@test
+fn test_at_most_32_words_are_taken_at_a_time() [io, hw]
+    let c = chip()
+    c.st.insert(67, 1)
+    c.regs.insert(0x06, 0x03)
+    c.regs.insert(0x07, 0x03)
+    c.regs.insert(0x09, 0x02)
+    for i in 0..40
+        fifo_push(c, 245760 + 2 * i)
+    let d = i2c_dut(c)
+    var press: Vec[Int; 32] = Vec.new()
+    var temp: Vec[Int; 32] = Vec.new()
+    test.assert_eq(dps310.fifo_read(d, test_cal(), var press, var temp), 32)
+    test.assert_eq(temp.len(), 32)
+    test.assert_eq(dps310.fifo_read(d, test_cal(), var press, var temp), 8)
+
+@test
+fn test_a_fifo_read_stops_when_the_part_stops_answering() [io, hw]
+    let c = chip()
+    c.regs.insert(0x06, 0x03)
+    c.regs.insert(0x07, 0x03)
+    c.regs.insert(0x09, 0x02)
+    fifo_push(c, 245760)
+    fifo_push(c, 3932161)
+    fifo_push(c, 245762)
+    let f = flaky(c, 0, 0)
+    f.quiet.insert(1, 1)
+    f.quiet.insert(0, 2)
+    var press: Vec[Int; 32] = Vec.new()
+    var temp: Vec[Int; 32] = Vec.new()
+    test.assert_eq(dps310.fifo_read(f, test_cal(), var press, var temp), 2)
+    test.assert_eq(temp.len(), 1)
+    test.assert_eq(press.len(), 1)
+    // The configuration cannot be read.
+    let e = chip()
+    let g = flaky_read(e, 0x06, 1)
+    test.assert_eq(dps310.fifo_read(g, test_cal(), var press, var temp), 0)
+    test.assert_eq(press.len(), 0)
+
+// ── The temperature workaround ───────────────────────────────────────
+
+@test
+fn test_a_part_with_the_check_bit_set_needs_no_workaround() [io, hw]
+    let c = chip()
+    c.regs.insert(0x32, 0x02)
+    log_clear(c)
+    test.assert(dps310.temp_workaround(i2c_dut(c)))
+    log_is(c, [2, 0x77, 0x32, 1, -1])
+
+@test
+fn test_a_part_without_the_check_bit_gets_the_five_writes_in_order() [io, hw]
+    let c = chip()
+    log_clear(c)
+    test.assert(dps310.temp_workaround(i2c_dut(c)))
+    log_is(c, [2, 0x77, 0x32, 1, -1,
+               1, 0x77, 0x0E, 0xA5, -1, 1, 0x77, 0x0F, 0x96, -1, 1, 0x77, 0x62, 0x02, -1,
+               1, 0x77, 0x0E, 0x00, -1, 1, 0x77, 0x0F, 0x00, -1])
+
+@test
+fn test_the_workaround_refusals() [io, hw]
+    let c = chip()
+    c.st.insert(4, 0)
+    test.assert(not dps310.temp_workaround(i2c_dut(c)))
+    let regs = [0x0E, 0x0F, 0x62, 0x0E, 0x0F]
+    let nth = [1, 1, 1, 2, 2]
+    for i in 0..regs.len()
+        let f = flaky(chip(), regs[i], nth[i])
+        test.assert(not dps310.temp_workaround(f))
+
+// ── Bring-up ─────────────────────────────────────────────────────────
+
+@test
+fn test_begin_brings_the_part_up_over_i2c_at_0x77() [io, hw]
+    let c = chip()
+    // Stale settings from a previous run of the program.
+    c.regs.insert(0x09, 0xFF)
+    c.regs.insert(0x06, 0x77)
+    test.assert(dps310.start(i2c_dut(c)))
+    test.assert_eq(reg_of(c, 0x06), 0x23)
+    test.assert_eq(reg_of(c, 0x07), 0x23)
+    // The interrupt on the pin: pressure ready, active low at 0x77.
+    test.assert_eq(reg_of(c, 0x09), 0x10)
+    test.assert_eq(reg_of(c, 0x08), 7)
+    // The undocumented gain was written, and locked again.
+    test.assert_eq(reg_of(c, 0x62), 0x02)
+    test.assert_eq(reg_of(c, 0x0E), 0x00)
+    test.assert_eq(reg_of(c, 0x0F), 0x00)
+
+@test
+fn test_begin_sets_the_interrupt_active_high_when_sdo_is_strapped_low() [io, hw]
+    let c = chip()
+    c.st.insert(70, 0x76)
+    let d = I2cDut { bus: FakeI2c { c: c }, pins: pins(c), w: dev_bus.wiring_irq(dev_bus.wiring_i2c(0, 0x76), 65) }
+    test.assert(dps310.start(d))
+    test.assert_eq(reg_of(c, 0x09), 0x90)
+
+@test
+fn test_begin_leaves_the_interrupt_off_where_no_pin_is_wired() [io, hw]
+    let c = chip()
+    let d = I2cDut { bus: FakeI2c { c: c }, pins: pins(c), w: dev_bus.wiring_i2c(0, 0x77) }
+    c.regs.insert(0x09, 0xFF)
+    test.assert(dps310.start(d))
+    test.assert_eq(reg_of(c, 0x09), 0x00)
+
+@test
+fn test_begin_over_spi_has_no_interrupt() [io, hw]
+    let c = chip()
+    test.assert(dps310.start(spi_dut(c)))
+    test.assert_eq(reg_of(c, 0x09), 0x00)
+    test.assert_eq(reg_of(c, 0x08), 7)
+    test.assert_eq(at(c.st, 21), 3)
+
+@test
+fn test_begin_uses_the_temperature_sensor_the_coefficients_were_made_for() [io, hw]
+    // TMP_COEF_SRCE set: the MEMS element's sensor, so TMP_EXT is set.
+    let c = chip()
+    c.regs.insert(0x28, 0x80)
+    test.assert(dps310.start(i2c_dut(c)))
+    test.assert_eq(reg_of(c, 0x07), 0xA3)
+    let e = chip()
+    e.regs.insert(0x28, 0x00)
+    test.assert(dps310.start(i2c_dut(e)))
+    test.assert_eq(reg_of(e, 0x07), 0x23)
+
+@test
+fn test_begin_resets_first_and_waits_for_the_start_up_by_polling() [io, hw]
+    let c = chip()
+    c.st.insert(66, 40)
+    let d = i2c_dut(c)
+    log_clear(c)
+    test.assert(dps310.start(d))
+    // ID, the soft reset, then the polls of MEAS_CFG.
+    test.assert_eq(at(c.log, 0), 2)
+    test.assert_eq(at(c.log, 2), 0x0D)
+    test.assert_eq(at(c.log, 5), 1)
+    test.assert_eq(at(c.log, 7), 0x0C)
+    test.assert_eq(at(c.log, 8), 0x09)
+    test.assert_eq(at(c.log, 10), 2)
+    test.assert_eq(at(c.log, 12), 0x08)
+    // 40 polls read not ready, the 41st ready: 41 reads before the
+    // coefficients.
+    test.assert_eq(at(c.log, 10 + 5 * 41 + 2), 0x10)
+
+@test
+fn test_begin_refuses_a_part_that_is_not_there_or_not_a_dps310() [io, hw]
+    let c = chip()
+    c.st.insert(4, 0)
+    test.assert(not dps310.start(i2c_dut(c)))
+    let d = chip()
+    d.regs.insert(0x0D, 0x11)
+    test.assert(not dps310.start(i2c_dut(d)))
+    let e = chip()
+    test.assert(not dps310.start(I2cDut { bus: FakeI2c { c: e }, pins: pins(e), w: dev_bus.wiring_spi(0, 67) }))
+
+@test
+fn test_begin_refuses_a_part_that_never_finishes_its_start_up() [io, hw]
+    let c = chip()
+    c.st.insert(67, 1)
+    c.st.insert(66, 100000)
+    test.assert(not dps310.start(i2c_dut(c)))
+
+@test
+fn test_begin_refuses_a_temperature_that_never_finishes() [io, hw]
+    let c = chip()
+    c.st.insert(67, 1)
+    c.st.insert(65, 1)
+    test.assert(not dps310.start(i2c_dut(c)))
+
+@test
+fn test_begin_refuses_a_write_or_read_the_part_does_not_take() [io, hw]
+    // The writes of `start` in order, as (register, which write of it).
+    let regs = [0x0C, 0x07, 0x06, 0x09, 0x0E, 0x08, 0x08, 0x08, 0x08]
+    let nth = [1, 1, 1, 1, 1, 1, 2, 3, 4]
+    for i in 0..regs.len()
+        let f = flaky(chip(), regs[i], nth[i])
+        test.assert(not dps310.start(f))
+        test.assert(at(f.seen, regs[i]) >= nth[i])
+    // The coefficients, their source and the check register cannot be read.
+    let g = flaky_read(chip(), 0x10, 1)
+    test.assert(not dps310.start(g))
+    let h = flaky_read(chip(), 0x28, 1)
+    test.assert(not dps310.start(h))
+    // The first read of the ID.
+    let k = flaky_read(chip(), 0x0D, 1)
+    test.assert(not dps310.start(k))
+
+// ── The types over the host's board handles ──────────────────────────
+//
+// The host's handles are absent hardware: every transfer is refused, so
+// each method answers its "no part" value.  This runs the lines of the
+// two types that forward to the functions above.
+
+@test
+fn test_the_i2c_type_over_absent_hardware() [io, hw]
+    let w = dev_bus.wiring_i2c(0, 0x77)
+    let p = Dps310.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, w)
+    test.assert(not p.begin())
+    test.assert(p.reg(0x0D) == None)
+    test.assert(not p.set_reg(0x06, 1))
+    test.assert(p.calibration() == None)
+    test.assert(p.sample() == None)
+    test.assert(p.sample_with(test_cal()) == None)
+    test.assert(p.sample_once(test_cal()) == None)
+    test.assert(not p.ready())
+    test.assert_eq(p.clear_irq(), -1)
+    test.assert(not p.set_oversampling(3, 3))
+    test.assert(not p.set_rates(2, 2))
+    test.assert(not p.sleep())
+    test.assert(not p.run())
+    test.assert(not p.fifo_begin())
+    test.assert(not p.fifo_end())
+    var press: Vec[Int; 32] = Vec.new()
+    var temp: Vec[Int; 32] = Vec.new()
+    test.assert_eq(p.fifo_take(test_cal(), var press, var temp), 0)
+    test.assert_eq(p.irq_level(), -1)
+    test.assert_eq(p.baro_start(), -1)
+    test.assert(p.baro_read() == None)
+    test.assert_eq(p.temp_start(), -1)
+    test.assert(p.temp_read() == None)
+    test.assert(p.device_id() == None)
+
+@test
+fn test_the_spi_type_over_absent_hardware() [io, hw]
+    let w = DeviceWiring { bus: 0, addr: None, cs: None, irq: None, en: None }
+    let p = Dps310Spi.attach(BoardSpi { id: 0 }, BoardGpio { id: 0 }, w)
+    test.assert(not p.begin())
+    test.assert(p.reg(0x0D) == None)
+    test.assert(not p.set_reg(0x06, 1))
+    test.assert(p.calibration() == None)
+    test.assert(p.sample() == None)
+    test.assert(p.sample_with(test_cal()) == None)
+    test.assert(p.sample_once(test_cal()) == None)
+    test.assert(not p.ready())
+    test.assert_eq(p.clear_irq(), -1)
+    test.assert(not p.set_oversampling(3, 3))
+    test.assert(not p.set_rates(2, 2))
+    test.assert(not p.sleep())
+    test.assert(not p.run())
+    test.assert(not p.fifo_begin())
+    test.assert(not p.fifo_end())
+    var press: Vec[Int; 32] = Vec.new()
+    var temp: Vec[Int; 32] = Vec.new()
+    test.assert_eq(p.fifo_take(test_cal(), var press, var temp), 0)
+    test.assert_eq(p.irq_level(), -1)
+    test.assert_eq(p.irq_mode(), -1)
+    test.assert_eq(p.baro_start(), -1)
+    test.assert(p.baro_read() == None)
+    test.assert_eq(p.temp_start(), -1)
+    test.assert(p.temp_read() == None)
+    test.assert(p.device_id() == None)

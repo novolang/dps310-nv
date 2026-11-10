@@ -1,0 +1,50 @@
+// device_read — a reading loop for a DPS310 on a breakout, for an nRF52840 DK
+// or an nRF54LM20 DK.
+//
+// The breakout's SDA and SCL go to the board's I2C pins and its CSB pin to
+// the supply, which selects I2C; its SDO pin goes to the supply or is
+// left open, which puts the part at 0x77.  The program waits for the part
+// to start, brings it up (a soft reset, the coefficients, 8 times
+// oversampling at 4 results a second, continuous measurement), reads the
+// coefficients once and prints one line per result over RTT:
+//
+//     dps310 mC=<millidegrees> mPa=<millipascals>
+//
+// At sea level the pressure is about 101 325 000 millipascals.
+//
+// Build it with `novo build --target=nrf52840-dk tests/device_read.nv` or
+// `novo build --target=nrf54lm20-dk tests/device_read.nv`.
+
+use embedded_hal.{ BoardI2c, BoardGpio }
+use dev_bus
+use dps310
+use dps310.{ Dps310 }
+
+// The part's address with the SDO pin high or open.
+const ADDR = 0x77
+
+// A label and a number, written without building a string.
+fn field(label: Str, v: Int) [hw]
+    hal.uart.write(label)
+    hal.uart.write(str.from_int(v))
+
+@tier(embedded)
+fn main() [hw]
+    let part = Dps310.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, dev_bus.wiring_i2c(0, ADDR))
+    hal.timer.delay_ms(15)
+    if not part.begin()
+        hal.uart.write("dps310: no answer\n")
+        return
+    let Some(cal) = part.calibration() else return
+    loop
+        if part.ready()
+            match part.sample_with(cal)
+                Some(s) =>
+                    hal.uart.write("dps310")
+                    field(" mC=", s.milli_c)
+                    field(" mPa=", s.milli_pa)
+                    hal.uart.write("\n")
+                None =>
+                    hal.uart.write("dps310: no result\n")
+        else
+            hal.timer.delay_ms(10)
