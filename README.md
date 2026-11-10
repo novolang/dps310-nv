@@ -76,9 +76,8 @@ novo build --target=frdm-mcxn947 tests/device_read.nv
 
 The two Nordic board packages answer for I2C and SPI as absent hardware,
 so the build removes the code that follows the first bus read, and their
-rows are the image without the driver's reading path.  The feature
-`features/embedded-devex/nordic-twim-i2c-driver.md` in the novo-lang
-repository tracks the missing Nordic I2C driver.  The FRDM-MCXN947 board
+rows are the image without the driver's reading path.  The novo-lang
+repository tracks the missing Nordic I2C driver as a feature.  The FRDM-MCXN947 board
 package drives I2C and SPI, and its row is the image with the driver's
 code in it.  The compensation is binary64 arithmetic, which these cores
 compute in software; the compiler's support library holds it, 7,926 bytes

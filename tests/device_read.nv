@@ -44,7 +44,7 @@ fn main() [hw]
                     field(" mC=", s.milli_c)
                     field(" mPa=", s.milli_pa)
                     hal.uart.write("\n")
-                None =>
+                None    =>
                     hal.uart.write("dps310: no result\n")
         else
             hal.timer.delay_ms(10)

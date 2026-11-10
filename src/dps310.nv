@@ -78,17 +78,17 @@ use dev_thermo.{ TempMilliC, Thermometer }
 use dev_id.{ DeviceId, Identifiable }
 
 // The registers.
-let PSR_B2    = 0x00
-let PRS_CFG   = 0x06
-let TMP_CFG   = 0x07
-let MEAS_CFG  = 0x08
-let CFG_REG   = 0x09
-let INT_STS   = 0x0A
-let FIFO_STS  = 0x0B
-let RESET     = 0x0C
+let PSR_B2     = 0x00
+let PRS_CFG    = 0x06
+let TMP_CFG    = 0x07
+let MEAS_CFG   = 0x08
+let CFG_REG    = 0x09
+let INT_STS    = 0x0A
+let FIFO_STS   = 0x0B
+let RESET      = 0x0C
 let PRODUCT_ID = 0x0D
-let COEF      = 0x10
-let COEF_SRCE = 0x28
+let COEF       = 0x10
+let COEF_SRCE  = 0x28
 
 // Registers that no table of the data sheet lists, which the temperature
 // workaround reads and writes (see `temp_workaround`).
@@ -104,34 +104,34 @@ let ID_DPS310 = 0x10
 let SPI_READ = 0x80
 
 // RESET: the soft-reset command, and the FIFO flush bit.
-let RESET_SOFT = 0x09
+let RESET_SOFT       = 0x09
 let RESET_FIFO_FLUSH = 0x80
 
 // MEAS_CFG: the coefficient and sensor ready bits, the two result ready
 // bits, and the measurement control field.
-let MEAS_COEF_RDY = 0x80
+let MEAS_COEF_RDY   = 0x80
 let MEAS_SENSOR_RDY = 0x40
-let MEAS_TMP_RDY = 0x20
-let MEAS_PRS_RDY = 0x10
-let MEAS_CTRL = 0x07
+let MEAS_TMP_RDY    = 0x20
+let MEAS_PRS_RDY    = 0x10
+let MEAS_CTRL       = 0x07
 // MEAS_CTRL's values: standby, a pressure and a temperature measurement on
 // request, and the background modes.
-let CTRL_STANDBY = 0
-let CTRL_PRESSURE = 1
-let CTRL_TEMPERATURE = 2
-let CTRL_BG_PRESSURE = 5
+let CTRL_STANDBY        = 0
+let CTRL_PRESSURE       = 1
+let CTRL_TEMPERATURE    = 2
+let CTRL_BG_PRESSURE    = 5
 let CTRL_BG_TEMPERATURE = 6
-let CTRL_BG_BOTH = 7
+let CTRL_BG_BOTH        = 7
 
 // CFG_REG: the interrupt polarity and sources, the result shifts, the FIFO
 // enable.
-let CFG_INT_HL = 0x80
+let CFG_INT_HL   = 0x80
 let CFG_INT_FIFO = 0x40
-let CFG_INT_TMP = 0x20
-let CFG_INT_PRS = 0x10
-let CFG_T_SHIFT = 0x08
-let CFG_P_SHIFT = 0x04
-let CFG_FIFO_EN = 0x02
+let CFG_INT_TMP  = 0x20
+let CFG_INT_PRS  = 0x10
+let CFG_T_SHIFT  = 0x08
+let CFG_P_SHIFT  = 0x04
+let CFG_FIFO_EN  = 0x02
 
 // FIFO_STS: the empty flag.
 let FIFO_EMPTY = 0x01
@@ -140,25 +140,25 @@ let FIFO_DEPTH = 32
 
 // TMP_CFG's external-sensor bit, and the field widths of PRS_CFG and
 // TMP_CFG.
-let TMP_EXT = 0x80
+let TMP_EXT    = 0x80
 let RATE_SHIFT = 4
-let RATE_MASK = 0x70
-let PRC_MASK = 0x0F
+let RATE_MASK  = 0x70
+let PRC_MASK   = 0x0F
 
 // The counts a result register holds before the first measurement (0) and
 // after the FIFO runs dry (0x800000, which reads as -2^23).
-let RAW_NONE = 0
+let RAW_NONE  = 0
 let RAW_EMPTY = -8388608
 
 // The oversampling and rate codes `start` sets: 8 times, 4 per second.
-let PRC_DEFAULT = 3
+let PRC_DEFAULT  = 3
 let RATE_DEFAULT = 2
 // The largest oversampling and rate code (Tables PRS_CFG and TMP_CFG).
 let CODE_MAX = 7
 
 // The clocks `setup` asks for: I2C fast mode, and SPI at 4 MHz in mode 3.
-let I2C_HZ = 400000
-let SPI_HZ = 4000000
+let I2C_HZ   = 400000
+let SPI_HZ   = 4000000
 let SPI_MODE = 3
 
 // The address strap values: SDO low is 0x76.
@@ -220,8 +220,8 @@ pub fn i2c_write<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, v: Int) -> Bool [
 // control byte with R/W set, then the data, which the part shifts out with
 // no dummy byte in between.  Whether it ran, which is whether the wiring
 // has a chip select.
-pub fn spi_read_into<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, reg: Int,
-                                            n: Int, var dst: DevBytes) -> Bool [hw]
+pub fn spi_read_into<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, reg: Int, n: Int,
+                                            var dst: DevBytes) -> Bool [hw]
     var tx: DevBytes = Vec.new()
     let _ = tx.push((SPI_READ | (reg & 0x7F)) as u8)
     dev_bus.wiring_spi_exchange_into(bus, gpio, w, tx, n, var dst)
@@ -366,18 +366,18 @@ pub fn cal_of(b: DevBytes) -> Dps310Cal
 // The temperature in degrees Celsius for a raw count and the temperature
 // oversampling code it was taken at (section 4.9.2).
 pub fn temperature_c(cal: Dps310Cal, raw_t: Int, osr_t: Int) -> Float
-    let t_sc = (raw_t as Float) / (scale_of(osr_t) as Float)
-    (cal.c0 as Float) * 0.5 + (cal.c1 as Float) * t_sc
+    let t_sc = raw_t as Float / scale_of(osr_t) as Float
+    cal.c0 as Float * 0.5 + cal.c1 as Float * t_sc
 
 // The pressure in pascals for a raw pressure count and the oversampling
 // code it was taken at, with the raw temperature count and its oversampling
 // code (section 4.9.1).
 pub fn pressure_pa(cal: Dps310Cal, raw_p: Int, osr_p: Int, raw_t: Int, osr_t: Int) -> Float
-    let p_sc = (raw_p as Float) / (scale_of(osr_p) as Float)
-    let t_sc = (raw_t as Float) / (scale_of(osr_t) as Float)
-    let a = (cal.c00 as Float) + p_sc * ((cal.c10 as Float) + p_sc * ((cal.c20 as Float) + p_sc * (cal.c30 as Float)))
-    let b = a + t_sc * (cal.c01 as Float)
-    b + t_sc * p_sc * ((cal.c11 as Float) + p_sc * (cal.c21 as Float))
+    let p_sc = raw_p as Float / scale_of(osr_p) as Float
+    let t_sc = raw_t as Float / scale_of(osr_t) as Float
+    let a = cal.c00 as Float + p_sc * (cal.c10 as Float + p_sc * (cal.c20 as Float + p_sc * cal.c30 as Float))
+    let b = a + t_sc * cal.c01 as Float
+    b + t_sc * p_sc * (cal.c11 as Float + p_sc * cal.c21 as Float)
 
 // `x` rounded to the nearest whole number, halves away from zero.
 pub fn round_to_int(x: Float) -> Int
@@ -510,12 +510,12 @@ pub fn pressure_start<P: Dps310Port>(p: P) -> Int [hw]
     var b: DevBytes = Vec.new()
     if not p.read_regs(PRS_CFG, 3, var b)
         return -1
-    let mode = (b[2] as Int) & MEAS_CTRL
+    let mode = b[2] as Int & MEAS_CTRL
     if mode == CTRL_BG_PRESSURE or mode == CTRL_BG_BOTH
         return 0
     if not mode_start(p, CTRL_PRESSURE)
         return -1
-    conversion_us((b[0] as Int) & PRC_MASK)
+    conversion_us(b[0] as Int & PRC_MASK)
 
 // Starts a temperature measurement: the same contract as `pressure_start`,
 // with the temperature's oversampling and the background modes that
@@ -524,12 +524,12 @@ pub fn temperature_start<P: Dps310Port>(p: P) -> Int [hw]
     var b: DevBytes = Vec.new()
     if not p.read_regs(PRS_CFG, 3, var b)
         return -1
-    let mode = (b[2] as Int) & MEAS_CTRL
+    let mode = b[2] as Int & MEAS_CTRL
     if mode == CTRL_BG_TEMPERATURE or mode == CTRL_BG_BOTH
         return 0
     if not mode_start(p, CTRL_TEMPERATURE)
         return -1
-    conversion_us((b[1] as Int) & PRC_MASK)
+    conversion_us(b[1] as Int & PRC_MASK)
 
 // Waits for one of the result flags of MEAS_CFG by polling it, at most
 // `READY_POLLS` times: whether it came.
@@ -611,7 +611,7 @@ pub fn rate_write<P: Dps310Port>(p: P, pm_rate: Int, tmp_rate: Int) -> Bool [hw]
     var b: DevBytes = Vec.new()
     if not p.read_regs(PRS_CFG, 2, var b)
         return false
-    if not rates_fit(pm_rate, (b[0] as Int) & PRC_MASK, tmp_rate, (b[1] as Int) & PRC_MASK)
+    if not rates_fit(pm_rate, b[0] as Int & PRC_MASK, tmp_rate, b[1] as Int & PRC_MASK)
         return false
     if not reg_update(p, PRS_CFG, RATE_MASK, pm_rate << RATE_SHIFT)
         return false
@@ -667,8 +667,8 @@ pub fn fifo_read<P: Dps310Port>(p: P, cal: Dps310Cal, var press: Vec[Int; 32],
     var cfg: DevBytes = Vec.new()
     if not p.read_regs(PRS_CFG, 2, var cfg)
         return 0
-    let osr_p = (cfg[0] as Int) & PRC_MASK
-    let osr_t = (cfg[1] as Int) & PRC_MASK
+    let osr_p = cfg[0] as Int & PRC_MASK
+    let osr_t = cfg[1] as Int & PRC_MASK
     var words: Vec[Int; 32] = Vec.new()
     for _i in 0..FIFO_DEPTH
         if ((reg_read(p, FIFO_STS) ?? FIFO_EMPTY) & FIFO_EMPTY) != 0

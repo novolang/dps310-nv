@@ -46,7 +46,11 @@ fn at(m: HashMap<Int, Int>, k: Int) -> Int
 
 // The chip with ID, the coefficients and the reset values in place.
 fn chip() -> Chip
-    let c = Chip { regs: HashMap.new(), st: HashMap.new(), ro: HashMap.new(), log: HashMap.new(), fifo: HashMap.new() }
+    let c = Chip { regs: HashMap.new(),
+        st: HashMap.new(),
+        ro: HashMap.new(),
+        log: HashMap.new(),
+        fifo: HashMap.new() }
     c.regs.insert(0x0D, 0x10)
     c.regs.insert(0x32, 0x00)
     c.st.insert(4, 1)
@@ -59,7 +63,24 @@ fn chip() -> Chip
 // c0 = 175, c1 = -2000, c00 = 126653, c10 = -55000, c01 = -1700,
 // c11 = -1000, c20 = 10000, c21 = -1200, c30 = -2000.
 fn cal_bytes() -> [Int]
-    [0x0A, 0xF8, 0x30, 0x1E, 0xEB, 0xDF, 0x29, 0x28, 0xF9, 0x5C, 0xFC, 0x18, 0x27, 0x10, 0xFB, 0x50, 0xF8, 0x30]
+    [0x0A,
+        0xF8,
+        0x30,
+        0x1E,
+        0xEB,
+        0xDF,
+        0x29,
+        0x28,
+        0xF9,
+        0x5C,
+        0xFC,
+        0x18,
+        0x27,
+        0x10,
+        0xFB,
+        0x50,
+        0xF8,
+        0x30]
 
 fn put_cal(c: Chip)
     let b = cal_bytes()
@@ -363,12 +384,22 @@ impl Dps310Port for Flaky
         self.inner.irq_mode()
 
 fn flaky(c: Chip, reg: Int, nth: Int) -> Flaky
-    let f = Flaky { inner: i2c_dut(c), fail: HashMap.new(), seen: HashMap.new(), rfail: HashMap.new(), rseen: HashMap.new(), quiet: HashMap.new() }
+    let f = Flaky { inner: i2c_dut(c),
+        fail: HashMap.new(),
+        seen: HashMap.new(),
+        rfail: HashMap.new(),
+        rseen: HashMap.new(),
+        quiet: HashMap.new() }
     f.fail.insert(reg, nth)
     f
 
 fn flaky_read(c: Chip, reg: Int, nth: Int) -> Flaky
-    let f = Flaky { inner: i2c_dut(c), fail: HashMap.new(), seen: HashMap.new(), rfail: HashMap.new(), rseen: HashMap.new(), quiet: HashMap.new() }
+    let f = Flaky { inner: i2c_dut(c),
+        fail: HashMap.new(),
+        seen: HashMap.new(),
+        rfail: HashMap.new(),
+        rseen: HashMap.new(),
+        quiet: HashMap.new() }
     f.rfail.insert(reg, nth)
     f
 
@@ -427,7 +458,15 @@ fn sample_of(o: ?Dps310Sample) -> [Int]
 
 // The coefficients the test part holds, as `cal_of` decodes them.
 fn test_cal() -> Dps310Cal
-    Dps310Cal { c0: 175, c1: -2000, c00: 126653, c10: -55000, c01: -1700, c11: -1000, c20: 10000, c21: -1200, c30: -2000 }
+    Dps310Cal { c0: 175,
+        c1: -2000,
+        c00: 126653,
+        c10: -55000,
+        c01: -1700,
+        c11: -1000,
+        c20: 10000,
+        c21: -1200,
+        c30: -2000 }
 
 fn bytes_of(l: [Int]) -> DevBytes
     var b: DevBytes = Vec.new()
@@ -575,7 +614,7 @@ fn test_the_identity_is_id_with_its_revision_nibble_on_both_buses() [io, hw]
         Some(id) =>
             test.assert_eq(id.who, 0x10)
             test.assert(id.rev == Some(1))
-        None => test.assert(false)
+        None     => test.assert(false)
     match dps310.id_read(spi_dut(c))
         Some(id) => test.assert_eq(id.who, 0x10)
         None     => test.assert(false)
@@ -608,7 +647,24 @@ fn test_the_coefficients_at_the_ends_of_their_widths() [io, hw]
     test.assert_eq(m.c10, -1)
     test.assert_eq(m.c30, -1)
     // The largest values: 12-bit 2047, 20-bit 524287, 16-bit 32767.
-    let hi = dps310.cal_of(bytes_of([0x7F, 0xF7, 0xFF, 0x7F, 0xFF, 0xF7, 0xFF, 0xFF, 0x7F, 0xFF, 0x7F, 0xFF, 0x7F, 0xFF, 0x7F, 0xFF, 0x7F, 0xFF]))
+    let hi = dps310.cal_of(bytes_of([0x7F,
+        0xF7,
+        0xFF,
+        0x7F,
+        0xFF,
+        0xF7,
+        0xFF,
+        0xFF,
+        0x7F,
+        0xFF,
+        0x7F,
+        0xFF,
+        0x7F,
+        0xFF,
+        0x7F,
+        0xFF,
+        0x7F,
+        0xFF]))
     test.assert_eq(hi.c0, 2047)
     test.assert_eq(hi.c1, 2047)
     test.assert_eq(hi.c00, 524287)
@@ -616,7 +672,24 @@ fn test_the_coefficients_at_the_ends_of_their_widths() [io, hw]
     test.assert_eq(hi.c01, 32767)
     test.assert_eq(hi.c21, 32767)
     // The smallest: 12-bit -2048, 20-bit -524288, 16-bit -32768.
-    let lo = dps310.cal_of(bytes_of([0x80, 0x08, 0x00, 0x80, 0x00, 0x08, 0x00, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00]))
+    let lo = dps310.cal_of(bytes_of([0x80,
+        0x08,
+        0x00,
+        0x80,
+        0x00,
+        0x08,
+        0x00,
+        0x00,
+        0x80,
+        0x00,
+        0x80,
+        0x00,
+        0x80,
+        0x00,
+        0x80,
+        0x00,
+        0x80,
+        0x00]))
     test.assert_eq(lo.c0, -2048)
     test.assert_eq(lo.c1, -2048)
     test.assert_eq(lo.c00, -524288)
@@ -1239,7 +1312,9 @@ fn test_begin_brings_the_part_up_over_i2c_at_0x77() [io, hw]
 fn test_begin_sets_the_interrupt_active_high_when_sdo_is_strapped_low() [io, hw]
     let c = chip()
     c.st.insert(70, 0x76)
-    let d = I2cDut { bus: FakeI2c { c: c }, pins: pins(c), w: dev_bus.wiring_irq(dev_bus.wiring_i2c(0, 0x76), 65) }
+    let d = I2cDut { bus: FakeI2c { c: c },
+        pins: pins(c),
+        w: dev_bus.wiring_irq(dev_bus.wiring_i2c(0, 0x76), 65) }
     test.assert(dps310.start(d))
     test.assert_eq(reg_of(c, 0x09), 0x90)
 
