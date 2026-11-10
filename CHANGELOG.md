@@ -44,8 +44,9 @@ pressure sensor on an I2C or an SPI bus.
   fetched from Infineon's community copy.  The temperature workaround is
   not in it; it comes from Infineon's library and the Linux driver.
 - The device program builds for the nRF52840 DK and the nRF54LM20 DK, whose
-  board packages answer for I2C and SPI as absent hardware: on those images
-  `begin` answers `false` until the boards drive the buses.  The gap is
-  tracked by `features/embedded-devex/nordic-twim-i2c-driver.md`.
+  TWIM and SPIM drivers carry the reading path into the image: 24,636 and
+  25,692 bytes of flash.  Before the Nordic buses landed the images were 13,088
+  and 13,936 bytes, without the reading path.  A reply from the part over a
+  DK's bus is NOT VERIFIED.
 - The SPI three-wire mode and the temperature-ready interrupt are not
   implemented.
