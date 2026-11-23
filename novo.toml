@@ -1,6 +1,6 @@
 [package]
 name        = "dps310-nv"
-version     = "0.1.0"
+version     = "0.1.1"
 description = "A driver for Infineon's DPS310 digital barometric pressure sensor on an I2C or an SPI bus: pressure in pascals and temperature in millidegrees Celsius, compensated with the data sheet's formulas from the coefficients and the scale factor of each oversampling, command and background mode, the rates, the data-ready interrupt, the FIFO as an option and the product identity, as devices-nv's Barometer, Thermometer and Identifiable."
 license     = "Apache-2.0"
 stability   = "experimental"
@@ -17,7 +17,7 @@ novo        = ">= 0.24.0"
 [dependencies]
 # The board's I2C bus, SPI bus and GPIO handles, and the I2cBus, SpiBus
 # and GpioOut traits they implement.
-embedded-hal-nv = "^0.3.2"
+embedded-hal-nv = "^0.4.0"
 # The wiring record a board's device table hands `attach`, the register
 # helpers, and the Barometer, Thermometer and Identifiable traits.
-devices-nv      = "^0.3.2"
+devices-nv      = "^0.4.0"

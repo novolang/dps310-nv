@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.1 — 2026-11-23
+
+The package asks for embedded-hal-nv ^0.4.0 (was ^0.3.2) and devices-nv ^0.4.0 (was ^0.3.2), the minor of both trait packages that the other drivers and the board packages ask for, so one version of each serves a program that takes this package beside any of them.  Under the older ranges, a program that named this package and a driver on 0.4 stopped with "no version of 'embedded-hal-nv' satisfies every requirement".
+
+No signature of the package changed; the suite passes without an edit.
+
+The device program builds for the boards its README names, flash nrf52840-dk 20,068 B before and 20,012 B after; nrf54lm20-dk 21,292 B before and 21,232 B after; frdm-mcxn947 21,456 B before and 21,416 B after; nrf52-qemu 8,404 B before and 8,412 B after.
+
 ## 0.1.0
 
 The first release: a driver for Infineon's DPS310 digital barometric
