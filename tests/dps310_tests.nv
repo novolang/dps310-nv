@@ -12,7 +12,7 @@
 
 use std.test
 use embedded_hal.{ BoardI2c, BoardSpi, BoardGpio, I2cBus, SpiBus, GpioOut }
-use dev_bus.{ DeviceWiring, DevBytes }
+use dev_bus.{ DeviceWiring, DevBytes, RegPort }
 use dev_baro.{ Pascals, Barometer }
 use dev_thermo.{ TempMilliC, Thermometer }
 use dev_id.{ DeviceId, Identifiable }
@@ -302,15 +302,16 @@ struct I2cDut
     pins: FakePins
     w: DeviceWiring
 
-impl Dps310Port for I2cDut
-    fn setup(self) -> Bool [hw]
-        dps310.i2c_setup(self.bus, self.pins, self.w)
-
+impl RegPort for I2cDut
     fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
         dps310.i2c_read_into(self.bus, self.w, reg, n, var dst)
 
     fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
         dps310.i2c_write(self.bus, self.w, reg, v)
+
+impl Dps310Port for I2cDut
+    fn setup(self) -> Bool [hw]
+        dps310.i2c_setup(self.bus, self.pins, self.w)
 
     fn irq_level(self) -> Int [hw]
         dps310.irq_level_of(self.pins, self.w)
@@ -323,15 +324,16 @@ struct SpiDut
     pins: FakePins
     w: DeviceWiring
 
-impl Dps310Port for SpiDut
-    fn setup(self) -> Bool [hw]
-        dps310.spi_setup(self.bus, self.pins, self.w)
-
+impl RegPort for SpiDut
     fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
         dps310.spi_read_into(self.bus, self.pins, self.w, reg, n, var dst)
 
     fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
         dps310.spi_write(self.bus, self.pins, self.w, reg, v)
+
+impl Dps310Port for SpiDut
+    fn setup(self) -> Bool [hw]
+        dps310.spi_setup(self.bus, self.pins, self.w)
 
     fn irq_level(self) -> Int [hw]
         dps310.irq_level_of(self.pins, self.w)
@@ -353,10 +355,7 @@ struct Flaky
     rseen: HashMap<Int, Int>
     quiet: HashMap<Int, Int>
 
-impl Dps310Port for Flaky
-    fn setup(self) -> Bool [hw]
-        self.inner.setup()
-
+impl RegPort for Flaky
     fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
         let k = at(self.rseen, reg) + 1
         self.rseen.insert(reg, k)
@@ -376,6 +375,10 @@ impl Dps310Port for Flaky
         if at(self.fail, reg) == n
             return false
         self.inner.write_reg(reg, v)
+
+impl Dps310Port for Flaky
+    fn setup(self) -> Bool [hw]
+        self.inner.setup()
 
     fn irq_level(self) -> Int [hw]
         self.inner.irq_level()
@@ -480,7 +483,7 @@ fn bytes_of(l: [Int]) -> DevBytes
 fn test_an_i2c_read_is_the_register_and_a_repeated_start_for_any_count() [io, hw]
     let c = chip()
     let d = i2c_dut(c)
-    test.assert_eq(dps310.reg_read(d, 0x0D) ?? -1, 0x10)
+    test.assert_eq(d.read_reg(0x0D) ?? -1, 0x10)
     log_is(c, [2, 0x77, 0x0D, 1, -1])
     c.regs.insert(0x06, 11)
     c.regs.insert(0x07, 22)
@@ -503,17 +506,17 @@ fn test_a_missing_i2c_part_does_not_answer() [io, hw]
     let c = chip()
     c.st.insert(4, 0)
     let d = i2c_dut(c)
-    test.assert(dps310.reg_read(d, 0x0D) == None)
+    test.assert(d.read_reg(0x0D) == None)
     test.assert(not d.write_reg(0x06, 1))
-    test.assert(not dps310.reg_write(d, 0x06, 1))
-    test.assert(not dps310.reg_update(d, 0x06, 1, 1))
+    test.assert(not d.write_reg_verified(0x06, 1))
+    test.assert(not d.update_reg_verified(0x06, 1, 1))
     test.assert(dps310.id_read(d) == None)
 
 @test
 fn test_an_spi_read_sets_rw_and_carries_no_mb_bit_or_dummy_byte() [io, hw]
     let c = chip()
     let d = spi_dut(c)
-    test.assert_eq(dps310.reg_read(d, 0x0D) ?? -1, 0x10)
+    test.assert_eq(d.read_reg(0x0D) ?? -1, 0x10)
     log_is(c, [3, 0x8D, 0xFF, -1])
     test.assert_eq(at(d.pins.levels, 67), 1)
     c.regs.insert(0x06, 11)
@@ -540,7 +543,7 @@ fn test_an_spi_part_that_is_not_there_reads_0xff_and_is_no_part() [io, hw]
     let c = chip()
     c.st.insert(4, 0)
     let d = spi_dut(c)
-    test.assert_eq(dps310.reg_read(d, 0x0D) ?? -1, 0xFF)
+    test.assert_eq(d.read_reg(0x0D) ?? -1, 0xFF)
     test.assert(dps310.id_read(d) == None)
     c.st.insert(4, 1)
     c.regs.insert(0x0D, 0)
@@ -1472,3 +1475,13 @@ fn test_the_spi_type_over_absent_hardware() [io, hw]
     test.assert_eq(p.temp_start(), -1)
     test.assert(p.temp_read() == None)
     test.assert(p.device_id() == None)
+
+// ── The functions that the register methods replace ──────────────────
+
+@test
+fn test_the_deprecated_register_functions_answer_as_the_methods_do() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert_eq(dps310.reg_read(d, 0x0D), d.read_reg(0x0D))
+    test.assert_eq(dps310.reg_write(d, 0x0D, 0x01), d.write_reg_verified(0x0D, 0x01))
+    test.assert_eq(dps310.reg_update(d, 0x0D, 0x0F, 0x01), d.update_reg_verified(0x0D, 0x0F, 0x01))

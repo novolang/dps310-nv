@@ -183,7 +183,7 @@ Bringing CSB low once switches the part off I2C until the next power-on
 
 | Module | What is in it |
 |---|---|
-| `dps310` | The types `Dps310` (I2C) and `Dps310Spi` (SPI), `Dps310Cal` and `Dps310Sample`, the trait `Dps310Port`, the bus framing, the register access, the compensation, the modes, the settings, the FIFO and the bring-up |
+| `dps310` | The types `Dps310` (I2C) and `Dps310Spi` (SPI), `Dps310Cal` and `Dps310Sample`, the trait `Dps310Port` over devices-nv's `RegPort`, the bus framing, the register access, the compensation, the modes, the settings, the FIFO and the bring-up |
 
 ## How to choose an entry point
 
@@ -219,7 +219,7 @@ continuous measurement.  It answers `false` for a part that does not
 answer 0x10 and for a register that does not hold what was written.
 
 A program that holds its own bus, or a test with a double of the part,
-implements `Dps310Port` over its bus and calls the module's functions,
+implements devices-nv's `RegPort` (`read_regs` and `write_reg`; the register reads and read-modify-writes, `port.read_reg(reg)` and `port.update_reg_verified(reg, mask, bits)`, are its methods) and `Dps310Port` over its bus and calls the module's functions,
 which take the port: `dps310.sample_read(port)`, `dps310.start(port)`.
 The framing of each bus is `i2c_read_into`, `i2c_write`, `spi_read_into`
 and `spi_write`, generic over `I2cBus` and `SpiBus`.  The compensation is
